@@ -10,6 +10,7 @@ import warnings
 import argparse
 import json
 import random
+import time  # <======= ۱. اضافه شدن ماژول زمان
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from metrics_utils import plot_roc_and_f1
@@ -181,6 +182,16 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     if is_main:
         print(f"\nEvaluating {name} set (Weighted Average)...")
         
+    # ======= ۲. شروع زمان‌سنجی (فقط روی GPU اصلی) =======
+    if is_main:
+        if device.type == 'cuda':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start_time = time.time()
+    # =========================================================
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, weights, _, _ = model(images, return_details=True)
@@ -201,6 +212,21 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     stats = torch.tensor([total_correct, total_samples], dtype=torch.long, device=device)
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+    # ======= ۳. توقف و محاسبه زمان (فقط روی GPU اصلی) =======
+    if is_main:
+        if device.type == 'cuda':
+            end_event.record()
+            torch.cuda.synchronize()
+            total_inference_time_ms = start_event.elapsed_time(end_event)
+        else:
+            total_inference_time_ms = (time.time() - start_time) * 1000.0
+            
+        # محاسبه بر اساس کل نمونه‌های واقعی دیتاست
+        total_real_samples = len(loader.dataset)
+        avg_time_per_sample_ms = total_inference_time_ms / total_real_samples if total_real_samples > 0 else 0
+        fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
+    # ==========================================================
 
     if ws > 1:
         gathered_true = [None for _ in range(ws)]
@@ -229,13 +255,27 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Samples: {total_samples:,}")
+        
+        # چاپ زمان استنتاج
+        print(f"\nInference Time Statistics:")
+        print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
+        print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
+        print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+        
         print(f"\nLearned Model Weights (Global):")
         for i, (w, mname) in enumerate(zip(final_weights, model_names)):
             print(f" {i+1:2d}. {mname:<25}: {w:6.4f} ({w*100:5.2f}%)")
         print(f"{'='*70}")
-        return acc, final_weights.tolist(), (all_y_true, all_y_score, all_y_pred)
+        
+        inference_stats = {
+            'total_time_sec': float(total_inference_time_ms / 1000),
+            'avg_time_per_sample_ms': float(avg_time_per_sample_ms),
+            'fps': float(fps)
+        }
+        
+        return acc, final_weights.tolist(), (all_y_true, all_y_score, all_y_pred), inference_stats
     
-    return 0.0, [0.0]*len(model_names), ([], [], [])
+    return 0.0, [0.0]*len(model_names), ([], [], []), {}
 
 
 def train_weighted_ensemble(ensemble_model, train_loader, val_loader, num_epochs, lr,
@@ -485,8 +525,8 @@ def main():
 
     ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
     
-    # دریافت خروجی‌ها برای JSON و Log
-    ensemble_test_acc, ensemble_weights, predictions_data = evaluate_ensemble_final_ddp(
+    # دریافت خروجی‌ها برای JSON و Log (شامل inference_stats)
+    ensemble_test_acc, ensemble_weights, predictions_data, inference_stats = evaluate_ensemble_final_ddp(
         ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
     if is_main:
@@ -509,12 +549,17 @@ def main():
         log_path = os.path.join(args.save_dir, 'prediction_log.txt')
         save_accuracy_log_from_results(y_true, y_pred, log_path, "Weighted Ensemble")
 
+        # ذخیره نتایج نهایی همراه با آمار سرعت
         final_results = {
             'seed': args.seed,
             'method': 'Weighted_Average',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
-            'ensemble': {'test_accuracy': float(ensemble_test_acc), 'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}},
+            'ensemble': {
+                'test_accuracy': float(ensemble_test_acc), 
+                'model_weights': {name: float(w) for name, w in zip(MODEL_NAMES, ensemble_weights)}
+            },
             'improvement': float(ensemble_test_acc - best_single),
+            'inference_stats': inference_stats,  # <======= اضافه شدن آمار سرعت به JSON
             'training_history': history
         }
 
