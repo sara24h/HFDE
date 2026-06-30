@@ -10,6 +10,7 @@ import warnings
 import argparse
 import json
 import random
+import time  # <======= ۱. اضافه شدن ماژول زمان
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP, DataParallel as DP
 from metrics_utils import plot_roc_and_f1
@@ -158,7 +159,6 @@ def evaluate_single_model_ddp(model: nn.Module, loader: DataLoader, device: torc
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     
-    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
@@ -183,7 +183,6 @@ def evaluate_accuracy_ddp(model, loader, device):
 
     correct_tensor = torch.tensor(correct, dtype=torch.long, device=device)
     
-    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
     
@@ -204,6 +203,16 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     if is_main:
         print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
     
+    # ======= ۲. شروع زمان‌سنجی (فقط روی GPU اصلی) =======
+    if is_main:
+        if device.type == 'cuda':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start_time = time.time()
+    # =========================================================
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
         outputs, _ = model(images, return_details=False)
@@ -217,9 +226,21 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         
         total_correct += pred_int.eq(labels.long()).sum().item()
 
+    # ======= ۳. توقف و محاسبه زمان (فقط روی GPU اصلی) =======
+    if is_main:
+        if device.type == 'cuda':
+            end_event.record()
+            torch.cuda.synchronize()
+            total_inference_time_ms = start_event.elapsed_time(end_event)
+        else:
+            total_inference_time_ms = (time.time() - start_time) * 1000.0
+            
+        avg_time_per_sample_ms = total_inference_time_ms / total_real_samples if total_real_samples > 0 else 0
+        fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
+    # ==========================================================
+
     correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
     
-    # ---> اصلاح باگ: فقط در صورت فعال بودن DDP آل ردوس کن <---
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
 
@@ -254,6 +275,12 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Real Samples: {total_real_samples:,}")
         
+        # چاپ زمان استنتاج
+        print(f"\nInference Time Statistics:")
+        print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
+        print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
+        print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+        
         print(f"\nMeta-Learner (Logistic Regression) Analysis:")
         print(f"  Bias (Intercept): {bias:+.4f}")
         print(f"  Learned Weights (Importance of each base model):")
@@ -261,9 +288,16 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
             print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
         
         print(f"{'='*70}")
-        return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred)
+        
+        inference_stats = {
+            'total_time_sec': float(total_inference_time_ms / 1000),
+            'avg_time_per_sample_ms': float(avg_time_per_sample_ms),
+            'fps': float(fps)
+        }
+        
+        return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred), inference_stats
     
-    return 0.0, [0.0]*len(model_names), 0.0, ([], [], [])
+    return 0.0, [0.0]*len(model_names), 0.0, ([], [], []), {}
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
                    device, save_dir, is_main, model_names):
@@ -368,7 +402,6 @@ def setup_distributed():
             print(f"Distributed: rank {rank}/{world_size}, local_rank {local_rank}")
         return device, local_rank, rank, world_size
     else:
-        # ---> اصلاح: برای یک GPU هم به طور صریح cuda:0 بده تا تداخلی پیش نیاید <---
         device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         return device, 0, 0, 1
 
@@ -560,7 +593,8 @@ def main():
 
         ensemble_module = ensemble.module if hasattr(ensemble, 'module') else ensemble
         
-        ensemble_test_acc, learned_weights, learned_bias, predictions_data = evaluate_ensemble_final_ddp(
+        # دریافت خروجی‌ها به همراه inference_stats
+        ensemble_test_acc, learned_weights, learned_bias, predictions_data, inference_stats = evaluate_ensemble_final_ddp(
             ensemble_module, test_loader, device, "Test", MODEL_NAMES, is_main)
 
         if is_main:
@@ -580,6 +614,7 @@ def main():
             log_path_ensemble = os.path.join(current_save_dir, 'prediction_log_stacking.txt')
             save_accuracy_log_from_results(y_true, y_pred, log_path_ensemble, "Stacking Ensemble")
 
+            # ذخیره نتایج نهایی همراه با آمار سرعت
             final_results = {
                 'seed': current_seed,
                 'method': 'Stacking_LR',
@@ -593,6 +628,7 @@ def main():
                     'learned_bias': float(learned_bias)
                 },
                 'improvement': float(ensemble_test_acc - best_single),
+                'inference_stats': inference_stats,  # <======= اضافه شدن آمار سرعت به JSON
                 'training_history': history
             }
 
