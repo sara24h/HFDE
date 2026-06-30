@@ -47,11 +47,11 @@ def setup_device():
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args):
 
     model.eval()
-    
+
     base_dataset = test_loader_full.dataset
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
-    
+
     # استخراج اندیس‌های تست
     if hasattr(test_loader_full, 'sampler') and hasattr(test_loader_full.sampler, 'indices'):
         test_indices = test_loader_full.sampler.indices
@@ -69,25 +69,30 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     lines.append("-"*100)
 
     TP, TN, FP, FN = 0, 0, 0, 0
-    
+
     # لیست‌های برای ذخیره داده‌های ROC و JSON
     all_y_true = []
     all_y_score = []
     all_y_pred = []
 
-    all_model_weights = []  
-    
+    all_model_weights = []
+
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
 
-  
-    # ======= اضافه کردن محاسبه زمان استنتاج =======
-    if device.type == 'cuda':
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-    else:
-        start_time = time.time()
-    # ================================================
+    # ======= وارم‌آپ قبل از اندازه‌گیری زمان (فقط برای GPU) =======
+    # چند forward pass اولیه روی GPU به‌خاطر مقداردهی اولیه‌ی context،
+    # کش شدن کرنل‌ها و تخصیص اولیه‌ی حافظه کندتر از حالت پایدار هستند؛
+    # اگر این‌ها داخل اندازه‌گیری بیفتند، میانگین را به‌طور مصنوعی بالا می‌برند.
+    if device.type == 'cuda' and len(test_indices) > 0:
+        with torch.no_grad():
+            warmup_img, _ = base_dataset[test_indices[0]]
+            warmup_img = warmup_img.unsqueeze(0).to(device)
+            for _ in range(5):
+                _ = model(warmup_img, return_details=True)
+        torch.cuda.synchronize()
+    # ==================================================================
+
+    total_inference_time_ms = 0.0
 
     with torch.no_grad():
         for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
@@ -99,48 +104,58 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
-            
+
+            # ======= اندازه‌گیری زمان فقط دور forward pass =======
+            # نکته: I/O دیسک (base_dataset[global_idx])، get_sample_info،
+            # و append/فرمت‌بندی لاگ عمداً بیرون از این بلوک قرار گرفته‌اند
+            # تا فقط زمان واقعی استنتاج مدل اندازه‌گیری شود.
+            if device.type == 'cuda':
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+            else:
+                start_time = time.time()
+
             # پیش‌بینی مدل با دریافت جزئیات وزن‌ها
             output, final_weights, _, _ = model(image, return_details=True)
-            
+
+            if device.type == 'cuda':
+                end_event.record()
+                torch.cuda.synchronize()  # منتظر می‌ماند تا فقط همین forward pass تمام شود
+                total_inference_time_ms += start_event.elapsed_time(end_event)
+            else:
+                total_inference_time_ms += (time.time() - start_time) * 1000.0
+            # ========================================================
+
             # محاسبه احتمال (Score) و کلاس پیش‌بینی شده
             prob = torch.sigmoid(output.squeeze()).item()
-            
+
             # ذخیره وزن هر مدل
             all_model_weights.append(final_weights.squeeze(0).cpu().numpy())
-            
+
             pred_int = int(prob > 0.5)
-            
+
             # ذخیره برای ROC و JSON
             all_y_true.append(label_int)
             all_y_score.append(prob)
             all_y_pred.append(pred_int)
-            
-            
+
+
             if label_int == 1:
                 if pred_int == 1: TP += 1
                 else: FN += 1
             else:
                 if pred_int == 1: FP += 1
                 else: TN += 1
-            
+
             correct_str = "Yes" if pred_int == label_int else "No"
             filename = os.path.basename(path)
             if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
             line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
             lines.append(line)
 
-    # ======= توقف و محاسبه زمان استنتاج =======
-    if device.type == 'cuda':
-        end_event.record()
-        torch.cuda.synchronize() # منتظر می‌ماند تا کارهای GPU تمام شود
-        total_inference_time_ms = start_event.elapsed_time(end_event)
-    else:
-        total_inference_time_ms = (time.time() - start_time) * 1000.0
-    # ================================================
-
     total_samples = len(all_y_true)
-    
+
     # ======= محاسبه میانگین زمان و FPS (بسیار مهم) =======
     avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
     fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
@@ -156,13 +171,13 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    
+
     # چاپ زمان استنتاج
-    print(f"\nInference Time Statistics:")
+    print(f"\nInference Time Statistics (model forward pass only):")
     print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
     print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
     print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
-    
+
     print(f"\nPrecision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"Specificity: {specificity:.4f}")
@@ -180,18 +195,18 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     # ════════════════════════════════════════════════════════════════
     if len(all_model_weights) > 0:
         weights_np = np.array(all_model_weights)
-        
+
         print(f"\n{'='*70}")
         print("MODEL ACTIVATION STATISTICS (Final Evaluation)")
         print(f"{'='*70}")
-        
+
         activation_threshold = 1e-4
         active_mask = (weights_np > activation_threshold).astype(float)
-        
+
         activation_rates = active_mask.mean(axis=0) * 100
         avg_weights = weights_np.mean(axis=0)
         max_weights = weights_np.max(axis=0)
-        
+
         print(f"\n  {'Model':<35} {'Active %':>10} {'Avg Weight':>12} {'Max Weight':>12}")
         print(f"  {'-'*70}")
         for i, name in enumerate(model_names):
@@ -202,26 +217,26 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             bar = '█' * bar_length + '░' * (50 - bar_length)
             print(f"  {i+1:2d}. {name:<30}: {act_pct:6.2f}%  | {avg_w:.6f}  | {max_w:.6f}")
             print(f"      [{bar}]")
-        
+
         print(f"  {'-'*70}")
         print(f"  {'Overall Average':<35} {activation_rates.mean():6.2f}%")
-        
+
         active_per_sample = active_mask.sum(axis=1)
         print(f"\n  Active Models Per Sample:")
         print(f"    Min:    {int(active_per_sample.min())}")
         print(f"    Max:    {int(active_per_sample.max())}")
         print(f"    Mean:   {active_per_sample.mean():.2f}")
         print(f"    Median: {np.median(active_per_sample):.1f}")
-        
+
         unique_counts, count_freq = np.unique(active_per_sample.astype(int), return_counts=True)
         print(f"\n  Distribution of Active Model Count:")
         for count, freq in zip(unique_counts, count_freq):
             pct = 100.0 * freq / len(all_model_weights)
             bar = '█' * int(pct / 2)
             print(f"    {count} model(s): {freq:5d} samples ({pct:5.2f}%) {bar}")
-        
+
         print(f"{'='*70}\n")
-        
+
         activation_stats = {
             "activation_rates_pct": {name: float(activation_rates[i]) for i, name in enumerate(model_names)},
             "average_weights": {name: float(avg_weights[i]) for i, name in enumerate(model_names)},
@@ -249,6 +264,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     output_str.append(f"Precision: {precision:.4f}")
     output_str.append(f"Recall: {recall:.4f}")
     output_str.append(f"Specificity: {specificity:.4f}")
+    output_str.append(f"\nInference Time (forward pass only): {avg_time_per_sample_ms:.2f} ms/image | {fps:.2f} FPS")
     output_str.append("\nConfusion Matrix:")
     output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
     output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
@@ -256,7 +272,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     output_str.append(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     output_str.append(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     output_str.extend(lines)
-    
+
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w') as f:
         f.write("\n".join(output_str))
@@ -266,7 +282,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     #                ذخیره داده‌های ROC (JSON & TXT)
     # ────────────────────────────────────────────────────────────────
     print("\nCollecting ROC data (y_true & y_score) ...")
-    
+
     # تبدیل به آرایه نامپای
     y_true_np = np.array(all_y_true)
     y_score_np = np.array(all_y_score)
@@ -449,7 +465,7 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
     total = 0
-    
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -458,7 +474,7 @@ def evaluate_single_model_exact(model: nn.Module, loader: DataLoader, device: to
         pred = (out.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
         total += labels.size(0)
-        
+
     acc = 100. * correct / total
     print(f" {name}: {acc:.2f}%")
     return acc
@@ -470,13 +486,13 @@ def evaluate_accuracy(model, loader, device):
     model.eval()
     correct = 0
     total_real_samples = len(loader.dataset)
-    
+
     for images, labels in tqdm(loader, desc="Validation"):
         images, labels = images.to(device), labels.to(device).float()
         outputs, _ = model(images)
         pred = (outputs.squeeze(1) > 0).long()
         correct += pred.eq(labels.long()).sum().item()
-    
+
     return 100. * correct / total_real_samples
 
 
@@ -503,20 +519,20 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
 
     for epoch in range(num_epochs):
         ensemble_model.train()
-        
+
         train_loss = 0.0
         train_correct = 0
-        
+
         # متغیرهای برای آمارهای دوره
         sum_per_model_hesitancy = torch.zeros(len(model_names), device=device)
         sum_cumsum_used = 0
         sum_active_models = torch.zeros(len(model_names), device=device)
-        
+
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
         for images, labels in pbar:
             images, labels = images.to(device), labels.to(device).float()
             optimizer.zero_grad()
-            
+
             outputs, weights, memberships, _ = ensemble_model(images, return_details=True)
             loss = criterion(outputs.squeeze(1), labels)
             loss.backward()
@@ -526,11 +542,11 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             train_loss += loss.item() * batch_size
             pred = (outputs.squeeze(1) > 0).long()
             train_correct += pred.eq(labels.long()).sum().item()
-            
+
             # محاسبه آمارهای دوره
             per_model_hesitancy = memberships.var(dim=2, unbiased=False)
             sum_per_model_hesitancy += per_model_hesitancy.sum(dim=0)
-            
+
             active_mask = (weights > 1e-4).float()
             num_active_per_sample = active_mask.sum(dim=1)
             cumsum_used_samples = (num_active_per_sample < len(model_names)).sum().item()
@@ -540,12 +556,12 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         # محاسبه با تعداد واقعی نمونه‌ها (تک GPU - نیازی به all_reduce نیست)
         train_loss = train_loss / total_real_samples
         train_acc = 100. * train_correct / total_real_samples
-        
+
         avg_per_model_hesitancy = sum_per_model_hesitancy / total_real_samples
         avg_cumsum_usage = (sum_cumsum_used / total_real_samples) * 100
         avg_model_activation = (sum_active_models / total_real_samples) * 100
         overall_mean_hesitancy = avg_per_model_hesitancy.mean().item()
-        
+
         val_acc = evaluate_accuracy(ensemble_model, val_loader, device)
         scheduler.step()
 
@@ -554,7 +570,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         print(f"{'='*70}")
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
         print(f"Val Acc: {val_acc:.2f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
-        
+
         print(f"\n{'Hesitancy (Variance) per Model:':^70}")
         print(f"{'-'*70}")
         for i, name in enumerate(model_names):
@@ -562,7 +578,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
             print(f"  {i+1:2d}. {name:<30}: {hesitancy_val:.6f}")
         print(f"{'-'*70}")
         print(f"  {'Overall Mean Hesitancy:':<30}  {overall_mean_hesitancy:.6f}")
-        
+
         print(f"\n{'Cumulative Weight Threshold (Cumsum) Analysis:':^70}")
         print(f"{'-'*70}")
         print(f"  {'Cumsum activated in:':<30}  {avg_cumsum_usage:.2f}% of samples")
@@ -573,7 +589,7 @@ def train_hesitant_fuzzy(ensemble_model, train_loader, val_loader, num_epochs, l
         else:
             print(f"  {'Status:':<30}  ✗ Low efficiency")
         print(f"  {'All models used in:':<30}  {100-avg_cumsum_usage:.2f}% of samples")
-        
+
         print(f"\n{'Model Activation Frequency:':^70}")
         print(f"{'-'*70}")
         for i, name in enumerate(model_names):
@@ -606,23 +622,23 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
-    
+
     # آرگومان‌های مدل
     parser.add_argument('--num_memberships', type=int, default=3)
     parser.add_argument('--cum_weight_threshold', type=float, default=0.9)
     parser.add_argument('--hesitancy_threshold', type=float, default=0.2)
-    
+
     # آرگومان‌های ویژوالایزیشن
     parser.add_argument('--num_grad_cam_samples', type=int, default=5)
     parser.add_argument('--num_lime_samples', type=int, default=5)
-    
+
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
         raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
-    
+
     # تنظیم دستگاه تک‌GPU
     device = setup_device()
 
@@ -639,7 +655,7 @@ def main():
     # نرمالیزیشن
     DEFAULT_MEANS = [(0.5207, 0.4258, 0.3806), (0.4460, 0.3622, 0.3416), (0.4668, 0.3816, 0.3414)]
     DEFAULT_STDS = [(0.2490, 0.2239, 0.2212), (0.2057, 0.1849, 0.1761), (0.2410, 0.2161, 0.2081)]
-    
+
     num_models = len(args.model_paths)
     if num_models > len(DEFAULT_MEANS):
         MEANS = DEFAULT_MEANS + [DEFAULT_MEANS[-1]] * (num_models - len(DEFAULT_MEANS))
@@ -653,7 +669,7 @@ def main():
 
     ensemble = FuzzyHesitantEnsemble(
         base_models, MEANS, STDS,
-        num_memberships=args.num_memberships, 
+        num_memberships=args.num_memberships,
         freeze_models=True,
         cum_weight_threshold=args.cum_weight_threshold,
         hesitancy_threshold=args.hesitancy_threshold
@@ -676,11 +692,11 @@ def main():
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True
     )
-    
+
     individual_accs = []
     for i, model in enumerate(base_models):
-        acc = evaluate_single_model_exact(model, test_loader_full, device, 
-                                          f"Model {i+1} ({MODEL_NAMES[i]})", 
+        acc = evaluate_single_model_exact(model, test_loader_full, device,
+                                          f"Model {i+1} ({MODEL_NAMES[i]})",
                                           MEANS[i], STDS[i])
         individual_accs.append(acc)
 
@@ -745,9 +761,9 @@ def main():
 
     plot_roc_and_f1(
         ensemble,
-        test_loader_full, 
-        device, 
-        args.save_dir, 
+        test_loader_full,
+        device,
+        args.save_dir,
         MODEL_NAMES,
         True
     )
