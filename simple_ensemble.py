@@ -10,13 +10,13 @@ import warnings
 import argparse
 import json
 import random
-import time  # <======= ۱. اضافه شدن ماژول زمان
+import time
 
 from metrics_utils import plot_roc_and_f1
 from old_dataset_utils import (
-    UADFVDataset, 
-    create_dataloaders, 
-    get_sample_info, 
+    UADFVDataset,
+    create_dataloaders,
+    get_sample_info,
     worker_init_fn
 )
 from visualization_utils import GradCAM, generate_lime_explanation, generate_visualizations
@@ -40,12 +40,12 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     if loader is None: return 0.0, None, None, 0.0, 0.0, 0.0
 
     model.eval()
-    
+
     # استخراج دیتاست پایه و اندیس‌ها
     base_dataset = loader.dataset
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
-        
+
     if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'indices'):
         test_indices = loader.sampler.indices
     elif hasattr(loader.dataset, 'indices'):
@@ -70,15 +70,19 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     total_samples = 0
 
     print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
-    
-    # ======= ۲. شروع زمان‌سنجی =======
-    if device.type == 'cuda':
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-    else:
-        start_time = time.time()
-    # =====================================
+
+    # ======= وارم‌آپ قبل از اندازه‌گیری زمان (فقط GPU) =======
+    # چند forward اولیه برای جلوگیری از احتساب overhead مقداردهی اولیه‌ی
+    # CUDA context و کش‌نشدن کرنل‌ها در میانگین زمان استنتاج
+    if device.type == 'cuda' and len(test_indices) > 0:
+        warmup_img, _ = base_dataset[test_indices[0]]
+        warmup_img = warmup_img.unsqueeze(0).to(device)
+        for _ in range(5):
+            _ = model(warmup_img, return_details=True)
+        torch.cuda.synchronize()
+    # ================================================================
+
+    total_inference_time_ms = 0.0
 
     for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
         try:
@@ -89,43 +93,49 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
 
         image = image.unsqueeze(0).to(device)
         label_int = int(label)
-        
-        # پیش‌بینی مدل
+
+        # ======= اندازه‌گیری زمان فقط دور forward pass =======
+        if device.type == 'cuda':
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+        else:
+            start_time = time.time()
+
         output, _, _, stacked_logits = model(image, return_details=True)
+
+        if device.type == 'cuda':
+            end_event.record()
+            torch.cuda.synchronize()
+            total_inference_time_ms += start_event.elapsed_time(end_event)
+        else:
+            total_inference_time_ms += (time.time() - start_time) * 1000.0
+        # ========================================================
 
         # تبدیل لاجیت‌ها به احتمالات
         probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
         pred_int = int(probs > 0.5)
-        
+
         all_y_true.append(label_int)
         all_y_score.append(probs)
         all_y_pred.append(pred_int)
-        
+
         is_correct = (pred_int == label_int)
         if is_correct: correct_count += 1
-        
+
         if label_int == 1:
             if pred_int == 1: TP += 1
             else: FN += 1
         else:
             if pred_int == 1: FP += 1
             else: TN += 1
-            
+
         total_samples += 1
-        
+
         filename = os.path.basename(path)
         if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
         line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
-
-    # ======= ۳. توقف و محاسبه زمان استنتاج =======
-    if device.type == 'cuda':
-        end_event.record()
-        torch.cuda.synchronize()
-        total_inference_time_ms = start_event.elapsed_time(end_event)
-    else:
-        total_inference_time_ms = (time.time() - start_time) * 1000.0
-    # ================================================
 
     # محاسبه میانگین زمان و FPS
     avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
@@ -140,13 +150,13 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    
+
     # چاپ زمان استنتاج
-    print(f"\nInference Time Statistics:")
+    print(f"\nInference Time Statistics (model forward pass only):")
     print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
     print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
     print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
-    
+
     print(f"\nPrecision: {prec:.4f}")
     print(f"Recall: {rec:.4f}")
     print(f"Specificity: {spec:.4f}")
@@ -166,6 +176,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     output_str.append(f"Precision: {prec:.4f}")
     output_str.append(f"Recall: {rec:.4f}")
     output_str.append(f"Specificity: {spec:.4f}")
+    output_str.append(f"\nInference Time (forward pass only): {avg_time_per_sample_ms:.2f} ms/image | {fps:.2f} FPS")
     output_str.append("\nConfusion Matrix:")
     output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
     output_str.append(f"    Actual Real   {TN:<15} {FP:<15}")
@@ -234,7 +245,7 @@ class SimpleAveragingEnsemble(nn.Module):
     def forward(self, x: torch.Tensor, return_details: bool = False):
         outputs = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
         raw_logits = torch.zeros(x.size(0), self.num_models, 1, device=x.device)
-    
+
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
             with torch.no_grad(): # برای امنیت بیشتر حافظه
@@ -242,10 +253,10 @@ class SimpleAveragingEnsemble(nn.Module):
                 if isinstance(out, (tuple, list)):
                     out = out[0]
             raw_logits[:, i] = out
-            outputs[:, i] = torch.sigmoid(out)  
-    
-        final_output = outputs.mean(dim=1)  
-    
+            outputs[:, i] = torch.sigmoid(out)
+
+        final_output = outputs.mean(dim=1)
+
         if return_details:
             weights = torch.ones(x.size(0), self.num_models, device=x.device) / self.num_models
             return final_output, weights, None, raw_logits
@@ -266,19 +277,19 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
         if not os.path.exists(path):
             print(f" [WARNING] File not found: {path}")
             continue
-            
+
         print(f" [{i+1}/{len(model_paths)}] Loading: {os.path.basename(path)}")
         try:
             ckpt = torch.load(path, map_location='cpu', weights_only=False)
             model = ResNet_50_pruned_hardfakevsreal(masks=ckpt['masks'])
             model.load_state_dict(ckpt['model_state_dict'])
             model = model.to(device).eval()
-            
+
             # ===== فریز کردن صد در صدی مدل های پایه =====
             for param in model.parameters():
                 param.requires_grad = False
             # =============================================
-            
+
             param_count = sum(p.numel() for p in model.parameters())
             print(f" → Parameters: {param_count:,} (FROZEN)")
             models.append(model)
@@ -301,7 +312,7 @@ def evaluate_single_model(model: nn.Module, loader: DataLoader, device: torch.de
     normalizer = MultiModelNormalization([mean], [std]).to(device)
     correct = 0
     total = 0
-    
+
     for images, labels in tqdm(loader, desc=f"Evaluating {name}"):
         images, labels = images.to(device), labels.to(device).float()
         images = normalizer(images, 0)
@@ -336,7 +347,7 @@ def main():
         raise ValueError("Number of model_names must match model_paths")
 
     set_seed(args.seed)
-    
+
     # تنظیم دستگاه به صورت تک GPU
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
@@ -394,10 +405,10 @@ def main():
     print("="*70)
 
     os.makedirs(args.save_dir, exist_ok=True)
-        
+
     # دریافت ۶ خروجی به جای ۳ خروجی
     ensemble_test_acc, y_true, y_score, total_time, avg_time, fps = final_evaluation_and_report(
-        ensemble, test_loader, device, args.save_dir, 
+        ensemble, test_loader, device, args.save_dir,
         "Simple Averaging Ensemble", args
     )
 
@@ -449,12 +460,12 @@ def main():
         args.num_grad_cam_samples, args.num_lime_samples,
         args.dataset, is_main=True
     )
-    
+
     plot_roc_and_f1(
         ensemble,
-        test_loader, 
-        device, 
-        args.save_dir, 
+        test_loader,
+        device,
+        args.save_dir,
         MODEL_NAMES,
         is_main=True
     )
