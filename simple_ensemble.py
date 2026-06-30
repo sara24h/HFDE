@@ -10,6 +10,7 @@ import warnings
 import argparse
 import json
 import random
+import time  # <======= ۱. اضافه شدن ماژول زمان
 
 from metrics_utils import plot_roc_and_f1
 from old_dataset_utils import (
@@ -36,7 +37,7 @@ def set_seed(seed: int = 42):
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
 @torch.no_grad()
 def final_evaluation_and_report(model, loader, device, save_dir, model_name, args):
-    if loader is None: return 0.0, None, None
+    if loader is None: return 0.0, None, None, 0.0, 0.0, 0.0
 
     model.eval()
     
@@ -70,6 +71,15 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
 
     print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
     
+    # ======= ۲. شروع زمان‌سنجی =======
+    if device.type == 'cuda':
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    else:
+        start_time = time.time()
+    # =====================================
+
     for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
         try:
             image, label = base_dataset[global_idx]
@@ -108,6 +118,19 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
         lines.append(line)
 
+    # ======= ۳. توقف و محاسبه زمان استنتاج =======
+    if device.type == 'cuda':
+        end_event.record()
+        torch.cuda.synchronize()
+        total_inference_time_ms = start_event.elapsed_time(end_event)
+    else:
+        total_inference_time_ms = (time.time() - start_time) * 1000.0
+    # ================================================
+
+    # محاسبه میانگین زمان و FPS
+    avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
+    fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
+
     total = TP + TN + FP + FN
     acc = (TP + TN) / total if total > 0 else 0
     prec = TP / (TP + FP) if (TP + FP) > 0 else 0
@@ -117,7 +140,14 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"Precision: {prec:.4f}")
+    
+    # چاپ زمان استنتاج
+    print(f"\nInference Time Statistics:")
+    print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
+    print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
+    print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+    
+    print(f"\nPrecision: {prec:.4f}")
     print(f"Recall: {rec:.4f}")
     print(f"Specificity: {spec:.4f}")
     print(f"\nConfusion Matrix:")
@@ -179,7 +209,8 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
             f.write(f"{int(t)}\t{s:.6f}\t{int(p)}\n")
     print(f"ROC data saved (TXT):  {roc_txt_path}")
 
-    return acc * 100, y_true_np, y_score_np
+    # Return metrics + Inference times
+    return acc * 100, y_true_np, y_score_np, total_inference_time_ms, avg_time_per_sample_ms, fps
 
 
 class MultiModelNormalization(nn.Module):
@@ -364,7 +395,8 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
         
-    ensemble_test_acc, y_true, y_score = final_evaluation_and_report(
+    # دریافت ۶ خروجی به جای ۳ خروجی
+    ensemble_test_acc, y_true, y_score, total_time, avg_time, fps = final_evaluation_and_report(
         ensemble, test_loader, device, args.save_dir, 
         "Simple Averaging Ensemble", args
     )
@@ -377,6 +409,7 @@ def main():
     print(f"Improvement: {ensemble_test_acc - best_single:+.2f}%")
     print("="*70)
 
+    # ذخیره در فایل JSON به همراه آمار سرعت
     final_results = {
         'method': 'Simple Averaging',
         'best_single_model': {
@@ -387,7 +420,12 @@ def main():
             'test_accuracy': float(ensemble_test_acc),
             'strategy': 'Uniform Weights'
         },
-        'improvement': float(ensemble_test_acc - best_single)
+        'improvement': float(ensemble_test_acc - best_single),
+        'inference_stats': {
+            'total_time_sec': float(total_time / 1000),
+            'avg_time_per_sample_ms': float(avg_time),
+            'fps': float(fps)
+        }
     }
 
     results_path = os.path.join(args.save_dir, 'final_results_simple_avg.json')
