@@ -10,6 +10,7 @@ import warnings
 import argparse
 import json
 import random
+import time  # <======= ۱. اضافه شدن ماژول زمان
 import matplotlib.pyplot as plt
 import cv2
 import torch.distributed as dist
@@ -297,7 +298,7 @@ def get_test_indices(test_loader):
 
 # ================== UNIFIED FINAL EVALUATION (McNemar + ROC) ==================
 def final_evaluation_unified(model, test_loader_full, device, save_dir, model_names, args, is_main):
-    if not is_main: return 0.0, None, None
+    if not is_main: return 0.0, None, None, {}
 
     model.eval()
     
@@ -328,6 +329,15 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
     
+    # ======= ۲. شروع زمان‌سنجی (فقط روی GPU اصلی) =======
+    if device.type == 'cuda':
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+    else:
+        start_time = time.time()
+    # =========================================================
+
     with torch.no_grad():
         for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
             try:
@@ -365,7 +375,19 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
             lines.append(line)
 
+    # ======= ۳. توقف و محاسبه زمان استنتاج (فقط روی GPU اصلی) =======
+    if device.type == 'cuda':
+        end_event.record()
+        torch.cuda.synchronize()
+        total_inference_time_ms = start_event.elapsed_time(end_event)
+    else:
+        total_inference_time_ms = (time.time() - start_time) * 1000.0
+        
     total_samples = len(all_y_true)
+    avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
+    fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
+    # ================================================================
+
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
     
@@ -376,7 +398,14 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"\n{'='*70}")
     print("FINAL RESULTS (HARD VOTING)")
     print(f"{'='*70}")
-    print(f"Precision: {precision:.4f}")
+    
+    # چاپ زمان استنتاج
+    print(f"\nInference Time Statistics:")
+    print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
+    print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
+    print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
+    
+    print(f"\nPrecision: {precision:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"Specificity: {specificity:.4f}")
     print(f"\nConfusion Matrix:")
@@ -386,6 +415,13 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"\nCorrect Predictions: {correct_count} ({acc:.2f}%)")
     print(f"Incorrect Predictions: {total_samples - correct_count} ({(1-acc)*100:.2f}%)")
     print("="*70)
+
+    # آمار سرعت
+    inference_stats = {
+        'total_time_sec': float(total_inference_time_ms / 1000),
+        'avg_time_per_sample_ms': float(avg_time_per_sample_ms),
+        'fps': float(fps)
+    }
 
     output_str = []
     output_str.append("-" * 100)
@@ -422,7 +458,8 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             "num_samples": int(total_samples),
             "positive_count": int(np.sum(y_true_np)),
             "negative_count": int(total_samples - np.sum(y_true_np)),
-            "model": "majority_voting_ensemble_HARD"
+            "model": "majority_voting_ensemble_HARD",
+            "inference_stats": inference_stats  # <======= اضافه شدن به JSON
         },
         "y_true": y_true_np.tolist(),
         "y_score": y_score_np.tolist(),
@@ -449,7 +486,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     except:
         pass
 
-    return acc, y_true_np, y_score_np
+    return acc, y_true_np, y_score_np, inference_stats
 
 # ================== DISTRIBUTED SETUP ==================
 def setup_distributed():
@@ -549,7 +586,8 @@ def main():
             is_distributed=False, seed=args.seed, is_main=True
         )
 
-        final_acc, y_true, y_scores = final_evaluation_unified(
+        # دریافت خروجی‌ها شامل inference_stats
+        final_acc, y_true, y_scores, inference_stats = final_evaluation_unified(
             ensemble_module, test_loader_full, device, args.save_dir, MODEL_NAMES, args, is_main
         )
 
@@ -568,7 +606,8 @@ def main():
             'method': 'Majority Voting (Hard)',
             'best_single_model': {'name': MODEL_NAMES[best_idx], 'accuracy': float(best_single)},
             'ensemble': {'test_accuracy': float(final_acc), 'vote_distribution': {name: {'fake': int(d[0]), 'real': int(d[1])} for name, d in zip(MODEL_NAMES, vote_dist)}},
-            'improvement': float(final_acc - best_single)
+            'improvement': float(final_acc - best_single),
+            'inference_stats': inference_stats  # <======= اضافه شدن به فایل نتایج نهایی
         }
         with open(os.path.join(args.save_dir, 'final_results.json'), 'w') as f:
             json.dump(final_results, f, indent=4)
