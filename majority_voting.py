@@ -328,15 +328,19 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     all_y_pred = []  # برای Accuracy از Hard Voting استفاده می‌کنیم
     
     print(f"\nRunning Unified Final Evaluation on {len(test_indices)} samples...")
-    
-    # ======= ۲. شروع زمان‌سنجی (فقط روی GPU اصلی) =======
-    if device.type == 'cuda':
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-    else:
-        start_time = time.time()
-    # =========================================================
+
+    # ======= وارم‌آپ قبل از اندازه‌گیری زمان (فقط GPU) =======
+    # چند forward اولیه برای جلوگیری از احتساب overhead مقداردهی اولیه‌ی
+    # CUDA context و کش‌نشدن کرنل‌ها در میانگین زمان استنتاج
+    if device.type == 'cuda' and len(test_indices) > 0:
+        warmup_img, _ = base_dataset[test_indices[0]]
+        warmup_img = warmup_img.unsqueeze(0).to(device)
+        for _ in range(5):
+            _ = model(warmup_img, return_details=True)
+        torch.cuda.synchronize()
+    # ================================================================
+
+    total_inference_time_ms = 0.0
 
     with torch.no_grad():
         for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
@@ -348,9 +352,25 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
 
             image = image.unsqueeze(0).to(device)
             label_int = int(label)
-            
+
+            # ======= اندازه‌گیری زمان فقط دور forward pass =======
+            if device.type == 'cuda':
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+            else:
+                start_time = time.time()
+
             # خروجی‌ها: final_decision, weights, avg_probs, stacked_logits
             decision, _, avg_probs, stacked_logits = model(image, return_details=True)
+
+            if device.type == 'cuda':
+                end_event.record()
+                torch.cuda.synchronize()
+                total_inference_time_ms += start_event.elapsed_time(end_event)
+            else:
+                total_inference_time_ms += (time.time() - start_time) * 1000.0
+            # ========================================================
             
             # پیش‌بینی نهایی بر اساس Hard Voting
             pred_int = int(decision.squeeze().item())
@@ -375,18 +395,9 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
             line = f"{i+1:<10} {filename:<60} {label_int:<10} {pred_int:<10} {correct_str:<10}"
             lines.append(line)
 
-    # ======= ۳. توقف و محاسبه زمان استنتاج (فقط روی GPU اصلی) =======
-    if device.type == 'cuda':
-        end_event.record()
-        torch.cuda.synchronize()
-        total_inference_time_ms = start_event.elapsed_time(end_event)
-    else:
-        total_inference_time_ms = (time.time() - start_time) * 1000.0
-        
     total_samples = len(all_y_true)
     avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
     fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
-    # ================================================================
 
     correct_count = TP + TN
     acc = 100.0 * correct_count / total_samples if total_samples > 0 else 0.0
@@ -400,7 +411,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     print(f"{'='*70}")
     
     # چاپ زمان استنتاج
-    print(f"\nInference Time Statistics:")
+    print(f"\nInference Time Statistics (model forward pass only):")
     print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
     print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
     print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
@@ -431,6 +442,7 @@ def final_evaluation_unified(model, test_loader_full, device, save_dir, model_na
     output_str.append(f"Precision: {precision:.4f}")
     output_str.append(f"Recall: {recall:.4f}")
     output_str.append(f"Specificity: {specificity:.4f}")
+    output_str.append(f"\nInference Time (forward pass only): {avg_time_per_sample_ms:.2f} ms/image | {fps:.2f} FPS")
     output_str.append("\nConfusion Matrix:")
     output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
     output_str.append(f"    Actual Real   {TP:<15} {FN:<15}")
