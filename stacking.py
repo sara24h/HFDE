@@ -195,52 +195,66 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
     total_correct = 0
     total_real_samples = len(loader.dataset)
     ws = dist.get_world_size() if dist.is_initialized() else 1
-    
+
     all_y_true = []
     all_y_score = []
     all_y_pred = []
 
     if is_main:
         print(f"\nEvaluating {name} set (Stacking - Logistic Regression)...")
-    
-    # ======= ۲. شروع زمان‌سنجی (فقط روی GPU اصلی) =======
-    if is_main:
-        if device.type == 'cuda':
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        else:
-            start_time = time.time()
-    # =========================================================
+
+    # ======= Warmup (فقط GPU) قبل از اندازه‌گیری زمان =======
+    # چند forward اولیه برای حذف overhead مقداردهی اولیه CUDA context
+    # و کش‌نشدن کرنل‌ها از میانگین زمان استنتاج
+    if is_main and device.type == 'cuda':
+        warmup_batch = next(iter(loader))[0][:1].to(device)
+        for _ in range(5):
+            _ = model(warmup_batch, return_details=False)
+        torch.cuda.synchronize()
+    # =============================================================
+
+    total_inference_time_ms = 0.0
 
     for images, labels in tqdm(loader, desc=f"Evaluating {name}", disable=not is_main):
         images, labels = images.to(device), labels.to(device)
+
+        # ======= اندازه‌گیری زمان فقط دور forward pass =======
+        if is_main:
+            if device.type == 'cuda':
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+            else:
+                start_time = time.time()
+
         outputs, _ = model(images, return_details=False)
-        
+
+        if is_main:
+            if device.type == 'cuda':
+                end_event.record()
+                torch.cuda.synchronize()
+                total_inference_time_ms += start_event.elapsed_time(end_event)
+            else:
+                total_inference_time_ms += (time.time() - start_time) * 1000.0
+        # ========================================================
+
         probs = torch.sigmoid(outputs.squeeze(1))
         pred_int = (probs > 0.5).long()
-        
+
         all_y_true.extend(labels.cpu().numpy().tolist())
         all_y_score.extend(probs.cpu().numpy().tolist())
         all_y_pred.extend(pred_int.cpu().numpy().tolist())
-        
+
         total_correct += pred_int.eq(labels.long()).sum().item()
 
-    # ======= ۳. توقف و محاسبه زمان (فقط روی GPU اصلی) =======
+    # ======= محاسبه میانگین زمان و FPS (فقط GPU اصلی) =======
     if is_main:
-        if device.type == 'cuda':
-            end_event.record()
-            torch.cuda.synchronize()
-            total_inference_time_ms = start_event.elapsed_time(end_event)
-        else:
-            total_inference_time_ms = (time.time() - start_time) * 1000.0
-            
         avg_time_per_sample_ms = total_inference_time_ms / total_real_samples if total_real_samples > 0 else 0
         fps = 1000.0 / avg_time_per_sample_ms if avg_time_per_sample_ms > 0 else 0
     # ==========================================================
 
     correct_tensor = torch.tensor(total_correct, dtype=torch.long, device=device)
-    
+
     if dist.is_initialized():
         dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
 
@@ -248,11 +262,11 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         gathered_true = [None for _ in range(ws)]
         gathered_score = [None for _ in range(ws)]
         gathered_pred = [None for _ in range(ws)]
-        
+
         dist.all_gather_object(gathered_true, all_y_true)
         dist.all_gather_object(gathered_score, all_y_score)
         dist.all_gather_object(gathered_pred, all_y_pred)
-        
+
         if is_main:
             all_y_true = [item for sublist in gathered_true for item in sublist]
             all_y_score = [item for sublist in gathered_score for item in sublist]
@@ -262,9 +276,9 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         all_y_true = all_y_true[:total_real_samples]
         all_y_score = all_y_score[:total_real_samples]
         all_y_pred = all_y_pred[:total_real_samples]
-        
+
         acc = 100. * correct_tensor.item() / total_real_samples
-        
+
         meta_learner = model.meta_learner
         weights = meta_learner.linear.weight.data.cpu().squeeze().numpy()
         bias = meta_learner.linear.bias.data.cpu().item()
@@ -274,29 +288,29 @@ def evaluate_ensemble_final_ddp(model, loader, device, name, model_names, is_mai
         print(f"{'='*70}")
         print(f" → Accuracy: {acc:.3f}%")
         print(f" → Total Real Samples: {total_real_samples:,}")
-        
-        # چاپ زمان استنتاج
-        print(f"\nInference Time Statistics:")
+
+        # چاپ زمان استنتاج (فقط forward pass)
+        print(f"\nInference Time Statistics (model forward pass only):")
         print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
         print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
         print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
-        
+
         print(f"\nMeta-Learner (Logistic Regression) Analysis:")
         print(f"  Bias (Intercept): {bias:+.4f}")
         print(f"  Learned Weights (Importance of each base model):")
         for i, (w, mname) in enumerate(zip(weights, model_names)):
             print(f"    {i+1:2d}. {mname:<25}: {w:+.4f}")
-        
+
         print(f"{'='*70}")
-        
+
         inference_stats = {
             'total_time_sec': float(total_inference_time_ms / 1000),
             'avg_time_per_sample_ms': float(avg_time_per_sample_ms),
             'fps': float(fps)
         }
-        
+
         return acc, weights.tolist(), bias, (all_y_true, all_y_score, all_y_pred), inference_stats
-    
+
     return 0.0, [0.0]*len(model_names), 0.0, ([], [], []), {}
 
 def train_stacking(ensemble_model, train_loader, val_loader, num_epochs, lr,
