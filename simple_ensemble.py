@@ -36,12 +36,34 @@ def set_seed(seed: int = 42):
 
 # ================== UNIFIED FINAL EVALUATION & REPORT ==================
 @torch.no_grad()
-def final_evaluation_and_report(model, loader, device, save_dir, model_name, args):
-    if loader is None: return 0.0, None, None, 0.0, 0.0, 0.0
+def final_evaluation_and_report(model, loader, device, save_dir, model_name, args, warmup_batches=5):
+    """
+    نکته مهم درباره اندازه‌گیری زمان (اصلاح‌شده نسبت به نسخه قبلی):
+    - قبلاً این تابع هر تصویر را جداگانه (batch_size=1، از طریق base_dataset[idx])
+      forward می‌کرد. این کار:
+        (الف) پارامتر args.batch_size را عملاً نادیده می‌گرفت،
+        (ب) لتنسی را به‌طور مصنوعی بالا نشان می‌داد چون از موازی‌سازی GPU
+            روی batch واقعی استفاده نمی‌شد،
+        (ج) اعداد ms/FPS را با فایل‌های دیگر (PaperKDEnsemble،
+            FuzzyHesitantEnsemble) غیرقابل‌مقایسه می‌کرد، چون آن‌ها با batch
+            واقعی اندازه‌گیری می‌شوند.
+    - در این نسخه، ارزیابی از طریق DataLoader واقعی (با batch_size ورودی
+      کاربر) انجام می‌شود؛ زمان دور کل batch اندازه‌گیری و بر تعداد نمونه‌ها
+      تقسیم می‌شود (avg_time_per_sample_ms = batch_time / batch_size به طور
+      میانگین) -- دقیقاً هم‌روش با دو فایل دیگر، تا مقایسه‌ی منصفانه ممکن شود.
+    - برای حفظ قابلیت لاگ per-sample (مسیر فایل، پیش‌بینی، برچسب واقعی برای
+      McNemar test)، به همراه هر batch از DataLoader، اندیس‌های global مربوط
+      به آن batch نیز به‌صورت دستی ردیابی می‌شوند (چون shuffle=False فرض
+      می‌شود؛ در غیر این صورت باید dataset یک Sampler ترتیبی داشته باشد).
+    - Warmup قبل از تایمینگ انجام می‌شود تا اثر CUDA context init و cuDNN
+      kernel caching از حساب اصلی کنار گذاشته شود.
+    """
+    if loader is None:
+        return 0.0, None, None, 0.0, 0.0, 0.0
 
     model.eval()
 
-    # استخراج دیتاست پایه و اندیس‌ها
+    # استخراج دیتاست پایه و اندیس‌ها (برای نگاشت به مسیر فایل در لاگ)
     base_dataset = loader.dataset
     if hasattr(base_dataset, 'dataset'):
         base_dataset = base_dataset.dataset
@@ -68,33 +90,34 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     TP, TN, FP, FN = 0, 0, 0, 0
     correct_count = 0
     total_samples = 0
-
-    print(f"\nRunning Final Evaluation on {len(test_indices)} samples...")
-
-    # ======= وارم‌آپ قبل از اندازه‌گیری زمان (فقط GPU) =======
-    # چند forward اولیه برای جلوگیری از احتساب overhead مقداردهی اولیه‌ی
-    # CUDA context و کش‌نشدن کرنل‌ها در میانگین زمان استنتاج
-    if device.type == 'cuda' and len(test_indices) > 0:
-        warmup_img, _ = base_dataset[test_indices[0]]
-        warmup_img = warmup_img.unsqueeze(0).to(device)
-        for _ in range(5):
-            _ = model(warmup_img, return_details=True)
-        torch.cuda.synchronize()
-    # ================================================================
-
     total_inference_time_ms = 0.0
 
-    for i, global_idx in enumerate(tqdm(test_indices, desc="Final Eval")):
+    # ======= Warmup قبل از اندازه‌گیری واقعی (فقط GPU) =======
+    print(f"\nWarming up ({warmup_batches} batches) before timing [{model_name}]...")
+    warmup_iter = iter(loader)
+    for _ in range(min(warmup_batches, len(loader))):
         try:
-            image, label = base_dataset[global_idx]
-            path, _ = get_sample_info(base_dataset, global_idx)
-        except Exception as e:
-            continue
+            w_images, _ = next(warmup_iter)
+        except StopIteration:
+            break
+        w_images = w_images.to(device)
+        _ = model(w_images, return_details=True)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    # =============================================================
 
-        image = image.unsqueeze(0).to(device)
-        label_int = int(label)
+    print(f"\nRunning Final Evaluation on {len(test_indices)} samples "
+          f"(batch_size={loader.batch_size}) for [{model_name}]...")
 
-        # ======= اندازه‌گیری زمان فقط دور forward pass =======
+    sample_pointer = 0  # برای نگاشت هر عنصر batch به global_idx واقعی در test_indices
+    # نکته: این نگاشت فقط زمانی صحیح است که loader با shuffle=False ساخته
+    # شده باشد (که برای ارزیابی نهایی/تست باید همینطور باشد).
+
+    for images, labels in tqdm(loader, desc=f"Eval {model_name}"):
+        images = images.to(device)
+        labels_int = labels.long().tolist()
+        batch_size_actual = images.size(0)
+
         if device.type == 'cuda':
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
@@ -102,7 +125,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
         else:
             start_time = time.time()
 
-        output, _, _, stacked_logits = model(image, return_details=True)
+        output, _, _, stacked_logits = model(images, return_details=True)
 
         if device.type == 'cuda':
             end_event.record()
@@ -110,32 +133,51 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
             total_inference_time_ms += start_event.elapsed_time(end_event)
         else:
             total_inference_time_ms += (time.time() - start_time) * 1000.0
-        # ========================================================
 
-        # تبدیل لاجیت‌ها به احتمالات
-        probs = torch.sigmoid(stacked_logits).mean(dim=1).item()
-        pred_int = int(probs > 0.5)
+        # تبدیل لاجیت‌ها به احتمالات (میانگین روی مدل‌های ensemble)
+        probs_batch = torch.sigmoid(stacked_logits).mean(dim=1).squeeze(-1).cpu().tolist()
+        if not isinstance(probs_batch, list):
+            probs_batch = [probs_batch]
 
-        all_y_true.append(label_int)
-        all_y_score.append(probs)
-        all_y_pred.append(pred_int)
+        for b in range(batch_size_actual):
+            prob = probs_batch[b]
+            label_int = labels_int[b]
+            pred_int = int(prob > 0.5)
 
-        is_correct = (pred_int == label_int)
-        if is_correct: correct_count += 1
+            all_y_true.append(label_int)
+            all_y_score.append(prob)
+            all_y_pred.append(pred_int)
 
-        if label_int == 1:
-            if pred_int == 1: TP += 1
-            else: FN += 1
-        else:
-            if pred_int == 1: FP += 1
-            else: TN += 1
+            is_correct = (pred_int == label_int)
+            if is_correct:
+                correct_count += 1
 
-        total_samples += 1
+            if label_int == 1:
+                if pred_int == 1: TP += 1
+                else: FN += 1
+            else:
+                if pred_int == 1: FP += 1
+                else: TN += 1
 
-        filename = os.path.basename(path)
-        if len(filename) > 55: filename = filename[:25] + "..." + filename[-27:]
-        line = f"{i+1:<10} {filename:<60} {label_int:<12} {pred_int:<15} {'Yes' if is_correct else 'No':<10}"
-        lines.append(line)
+            total_samples += 1
+
+            # نگاشت به مسیر فایل واقعی برای لاگ McNemar
+            if sample_pointer < len(test_indices):
+                global_idx = test_indices[sample_pointer]
+                try:
+                    path, _ = get_sample_info(base_dataset, global_idx)
+                    filename = os.path.basename(path)
+                except Exception:
+                    filename = f"index_{global_idx}"
+            else:
+                filename = "unknown"
+            sample_pointer += 1
+
+            if len(filename) > 55:
+                filename = filename[:25] + "..." + filename[-27:]
+            line = (f"{total_samples:<10} {filename:<60} {label_int:<12} "
+                    f"{pred_int:<15} {'Yes' if is_correct else 'No':<10}")
+            lines.append(line)
 
     # محاسبه میانگین زمان و FPS
     avg_time_per_sample_ms = total_inference_time_ms / total_samples if total_samples > 0 else 0
@@ -151,8 +193,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     print("FINAL RESULTS")
     print(f"{'='*70}")
 
-    # چاپ زمان استنتاج
-    print(f"\nInference Time Statistics (model forward pass only):")
+    print(f"\nInference Time Statistics (post-warmup, batch_size={loader.batch_size}):")
     print(f"  Total Time:     {total_inference_time_ms/1000:.2f} seconds")
     print(f"  Avg per Image:  {avg_time_per_sample_ms:.2f} ms")
     print(f"  Throughput:     {fps:.2f} FPS (Frames Per Second)")
@@ -176,7 +217,8 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     output_str.append(f"Precision: {prec:.4f}")
     output_str.append(f"Recall: {rec:.4f}")
     output_str.append(f"Specificity: {spec:.4f}")
-    output_str.append(f"\nInference Time (forward pass only): {avg_time_per_sample_ms:.2f} ms/image | {fps:.2f} FPS")
+    output_str.append(f"\nInference Time (batch_size={loader.batch_size}): "
+                       f"{avg_time_per_sample_ms:.2f} ms/image | {fps:.2f} FPS")
     output_str.append("\nConfusion Matrix:")
     output_str.append(f"                 {'Predicted Real':<15} {'Predicted Fake':<15}")
     output_str.append(f"    Actual Real   {TN:<15} {FP:<15}")
@@ -188,7 +230,7 @@ def final_evaluation_and_report(model, loader, device, save_dir, model_name, arg
     log_path = os.path.join(save_dir, 'prediction_log.txt')
     with open(log_path, 'w', encoding='utf-8') as f:
         f.write("\n".join(output_str))
-    print(f"✅ Prediction log saved to: {log_path}")
+    print(f"Prediction log saved to: {log_path}")
 
     print("\nCollecting ROC data (y_true & y_score) ...")
     y_true_np = np.array(all_y_true)
@@ -248,7 +290,7 @@ class SimpleAveragingEnsemble(nn.Module):
 
         for i in range(self.num_models):
             x_n = self.normalizations(x, i)
-            with torch.no_grad(): # برای امنیت بیشتر حافظه
+            with torch.no_grad():  # برای امنیت بیشتر حافظه
                 out = self.models[i](x_n)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
@@ -291,7 +333,7 @@ def load_pruned_models(model_paths: List[str], device: torch.device) -> List[nn.
             # =============================================
 
             param_count = sum(p.numel() for p in model.parameters())
-            print(f" → Parameters: {param_count:,} (FROZEN)")
+            print(f" -> Parameters: {param_count:,} (FROZEN)")
             models.append(model)
         except Exception as e:
             print(f" [ERROR] Failed to load {path}: {e}")
@@ -341,6 +383,8 @@ def main():
     parser.add_argument('--model_names', type=str, nargs='+', required=True)
     parser.add_argument('--save_dir', type=str, default='./output')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--warmup_batches', type=int, default=5,
+                         help='Number of batches to run before timing starts (discarded).')
     args = parser.parse_args()
 
     if len(args.model_names) != len(args.model_paths):
@@ -376,7 +420,8 @@ def main():
     total = sum(p.numel() for p in ensemble.parameters())
     print(f"Total params: {total:,} | Trainable: {trainable:,} | Frozen: {total-trainable:,}\n")
 
-    # ساخت دیتالودر (غیرتوزیع شده)
+    # ساخت دیتالودر (غیرتوزیع شده) -- برای test_loader باید shuffle=False باشد
+    # تا نگاشت per-sample به test_indices در final_evaluation_and_report درست بماند
     train_loader, val_loader, test_loader = create_dataloaders(
         args.data_dir, args.batch_size, dataset_type=args.dataset,
         is_distributed=False, seed=args.seed, is_main=True)
@@ -396,7 +441,7 @@ def main():
     best_single = max(individual_accs)
     best_idx = individual_accs.index(best_single)
 
-    print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) → {best_single:.2f}%")
+    print(f"\nBest Single: Model {best_idx+1} ({MODEL_NAMES[best_idx]}) -> {best_single:.2f}%")
     print("="*70)
     print("\nSkipping Training (Simple Averaging does not learn parameters)...\n")
 
@@ -409,7 +454,8 @@ def main():
     # دریافت ۶ خروجی به جای ۳ خروجی
     ensemble_test_acc, y_true, y_score, total_time, avg_time, fps = final_evaluation_and_report(
         ensemble, test_loader, device, args.save_dir,
-        "Simple Averaging Ensemble", args
+        "Simple Averaging Ensemble", args,
+        warmup_batches=args.warmup_batches
     )
 
     print("\n" + "="*70)
@@ -435,7 +481,9 @@ def main():
         'inference_stats': {
             'total_time_sec': float(total_time / 1000),
             'avg_time_per_sample_ms': float(avg_time),
-            'fps': float(fps)
+            'fps': float(fps),
+            'batch_size_used': args.batch_size,
+            'warmup_batches': args.warmup_batches
         }
     }
 
